@@ -16,9 +16,13 @@ let package = Package(
     dependencies: [
         // Here we define our package's external dependencies
         // and from where they can be fetched:
+        // Kyoto fork: vendored xcframework with mc_transaction_builder_add_presigned_partial_fill_input
+        // C FFI binding (built by .github/workflows/build-xcframework.yml on the fork). Pinned by
+        // commit revision so SPM resolution is deterministic and matches the published binary
+        // (LibMobileCoinLibrary.xcframework.zip checksum 1b3c7189...02b88f).
         .package(
-            url: "https://github.com/mobilecoinofficial/libmobilecoin.git",
-            from: "6.0.4"
+            url: "https://github.com/loperanger7/libmobilecoin.git",
+            revision: "4db3be141394379246d76b6f4e8d3c7cb9115442"
         ),
         .package(
             url: "https://github.com/apple/swift-protobuf.git",
