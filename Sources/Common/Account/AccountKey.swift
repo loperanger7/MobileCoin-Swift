@@ -40,6 +40,7 @@ public struct AccountKey {
 
     let subaddressPrivateKeys: SubaddressPrivateKeys
     let changeSubaddressPrivateKeys: SubaddressPrivateKeys
+    let extensionChangeSubaddressPrivateKeys: SubaddressPrivateKeys
 
     public let publicAddress: PublicAddress
     public let publicChangeAddress: PublicAddress
@@ -74,6 +75,10 @@ public struct AccountKey {
             viewPrivateKey: viewPrivateKey,
             spendPrivateKey: spendPrivateKey,
             subaddressIndex: changeSubaddressIndex)
+        self.extensionChangeSubaddressPrivateKeys = Self.makeSubaddressPrivateKeys(
+            viewPrivateKey: viewPrivateKey,
+            spendPrivateKey: spendPrivateKey,
+            subaddressIndex: McConstants.EXTENSION_CHANGE_SUBADDRESS_INDEX)
     }
 
     /// - Returns: `nil` when the input is not deserializable.
@@ -104,6 +109,7 @@ public struct AccountKey {
         [
             subaddressIndex: subaddressPrivateKeys,
             changeSubaddressIndex: changeSubaddressPrivateKeys,
+            McConstants.EXTENSION_CHANGE_SUBADDRESS_INDEX: extensionChangeSubaddressPrivateKeys,
         ]
     }
 

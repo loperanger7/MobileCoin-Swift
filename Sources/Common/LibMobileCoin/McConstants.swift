@@ -76,10 +76,14 @@ extension McConstants {
     /// An account's "default change address" is its first subaddress.
     static let DEFAULT_CHANGE_SUBADDRESS_INDEX = UInt64.max - 1
 
+    /// Kyoto extension uses subaddress 1 for change outputs.
+    static let EXTENSION_CHANGE_SUBADDRESS_INDEX: UInt64 = 1
+
     /// Possible subaddresses that a TxOut can be owned by
     static let POSSIBLE_SUBADDRESSES: [UInt64] = [
         Self.DEFAULT_CHANGE_SUBADDRESS_INDEX,
         Self.DEFAULT_SUBADDRESS_INDEX,
+        Self.EXTENSION_CHANGE_SUBADDRESS_INDEX,
     ]
 }
 
