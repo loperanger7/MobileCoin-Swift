@@ -67,6 +67,73 @@ enum TransactionBuilderUtils {
         }
     }
 
+    /// Add a pre-signed Input *with partial-fill rules* and return the outlay amounts
+    /// computed by the underlying builder.
+    ///
+    /// The C FFI returns a packed `McData*` blob laid out as:
+    ///   `[count: u32 LE][value: u64 LE, token_id: u64 LE] x count`
+    /// We parse it into `[Amount]` so callers can verify what the SCI consumed/emitted.
+    ///
+    /// - Parameter sciChangeAmount: the maker's unfilled remainder (in the SCI's base token).
+    ///   The builder uses this to compute the fill fraction. Must satisfy the SCI's
+    ///   `min_partial_fill_value` rule.
+    static func addSignedContingentInputPartialFill(
+        ptr: OpaquePointer,
+        signedContingentInput: SignedContingentInput,
+        sciChangeAmount: Amount
+    ) -> Result<[Amount], TransactionBuilderError> {
+        let sciData = signedContingentInput.serializedData
+        return sciData.asMcBuffer { sciDataPtr in
+            Data.make(withMcDataBytes: { errorPtr in
+                mc_transaction_builder_add_presigned_partial_fill_input(
+                    ptr,
+                    sciDataPtr,
+                    sciChangeAmount.value,
+                    sciChangeAmount.tokenId.value,
+                    &errorPtr)
+            }).mapError {
+                switch $0.errorCode {
+                case .invalidInput:
+                    return .invalidInput("\(redacting: $0.description)")
+                default:
+                    logger.fatalError("Unhandled LibMobileCoin error: \(redacting: $0)")
+                }
+            }
+        }.flatMap { packed in
+            parsePackedOutlayAmounts(packed)
+        }
+    }
+
+    /// Parse the packed `[count: u32 LE][value: u64 LE, token_id: u64 LE] x count` blob
+    /// returned by `mc_transaction_builder_add_presigned_partial_fill_input`.
+    private static func parsePackedOutlayAmounts(
+        _ data: Data
+    ) -> Result<[Amount], TransactionBuilderError> {
+        guard data.count >= 4 else {
+            return .failure(.invalidInput("Outlay blob too short for count header"))
+        }
+        let count = data.withUnsafeBytes { buf -> UInt32 in
+            buf.loadUnaligned(fromByteOffset: 0, as: UInt32.self).littleEndian
+        }
+        let expectedLen = 4 + Int(count) * 16
+        guard data.count == expectedLen else {
+            return .failure(.invalidInput(
+                "Outlay blob length \(data.count) != expected \(expectedLen) for count \(count)"))
+        }
+        var amounts: [Amount] = []
+        amounts.reserveCapacity(Int(count))
+        data.withUnsafeBytes { buf in
+            for i in 0..<Int(count) {
+                let valueOffset = 4 + i * 16
+                let tokenOffset = valueOffset + 8
+                let value = buf.loadUnaligned(fromByteOffset: valueOffset, as: UInt64.self).littleEndian
+                let tokenIdRaw = buf.loadUnaligned(fromByteOffset: tokenOffset, as: UInt64.self).littleEndian
+                amounts.append(Amount(value, in: TokenId(tokenIdRaw)))
+            }
+        }
+        return .success(amounts)
+    }
+
     static func addOutput(
         ptr: OpaquePointer,
         tombstoneBlockIndex: UInt64,
