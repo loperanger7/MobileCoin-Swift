@@ -159,6 +159,47 @@ struct TransactionPreparer {
         })
     }
 
+    func preparePartialFillSwapTransaction(
+        presignedInput: SignedContingentInput,
+        inputs: [KnownTxOut],
+        fillBaseAmount: Amount,
+        sciChangeBaseAmount: Amount,
+        fee: Amount,
+        tombstoneBlockIndex: UInt64,
+        blockVersion: BlockVersion,
+        completion: @escaping (
+            Result<PendingTransaction, TransactionPreparationError>
+        ) -> Void
+    ) {
+        performAsync(body1: { callback in
+            fogResolverManager.fogResolver(
+                addresses: [selfPaymentAddress],
+                desiredMinPubkeyExpiry: tombstoneBlockIndex,
+                completion: callback)
+        }, body2: { callback in
+            prepareInputs(inputs: inputs, completion: callback)
+        }, completion: {
+            completion($0.mapError { .connectionError($0) }
+                .flatMap { fogResolver, preparedInputs in
+
+                    TransactionBuilder.buildPartialFillSwap(
+                        context: TransactionBuilder.Context(
+                            accountKey: self.accountKey,
+                            blockVersion: blockVersion,
+                            fogResolver: fogResolver,
+                            memoType: .unused,
+                            tombstoneBlockIndex: tombstoneBlockIndex,
+                            fee: fee,
+                            rngSeed: rngSeed),
+                        inputs: preparedInputs,
+                        presignedInput: presignedInput,
+                        fillBaseAmount: fillBaseAmount,
+                        sciChangeBaseAmount: sciChangeBaseAmount
+                    ).mapError { .invalidInput(String(describing: $0)) }
+                })
+        })
+    }
+
     func preparePresignedInputTransaction(
         presignedInput: SignedContingentInput,
         inputs: [KnownTxOut],

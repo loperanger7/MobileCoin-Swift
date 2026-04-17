@@ -12,10 +12,9 @@
     {
       "identity" : "libmobilecoin",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/mobilecoinofficial/libmobilecoin.git",
+      "location" : "https://github.com/loperanger7/libmobilecoin.git",
       "state" : {
-        "revision" : "aaef756fe293bb1036f3e2147d1c085568568ecf",
-        "version" : "6.0.4"
+        "revision" : "4db3be141394379246d76b6f4e8d3c7cb9115442"
       }
     },
     {

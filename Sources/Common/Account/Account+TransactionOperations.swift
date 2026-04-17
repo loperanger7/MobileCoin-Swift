@@ -282,6 +282,127 @@ extension Account {
             }
         }
 
+        /// Prepare a partial-fill swap (MCIP-42 taker side).
+        ///
+        /// The taker pays `payCounterAmount` of the SCI's COUNTER token and receives
+        /// `fillBaseAmount` of the SCI's BASE token. `sciChangeBaseAmount` is the SCI's
+        /// unfilled remainder (= `sci.partialFillMaxBase - fillBaseAmount`); the caller
+        /// (KyotoSwapBuilder) is responsible for computing it from the wire-level SCI
+        /// metadata DEQS already exposes (so the SDK never has to unmask `RevealedTxOut`).
+        ///
+        /// The fee is always in MOB. Two directions:
+        ///   * counter == MOB (mob→eusd): selection covers `payCounterAmount + fee`;
+        ///     fee is deducted from the taker's COUNTER change in TransactionBuilder.
+        ///   * counter != MOB (eusd→mob): selection covers `payCounterAmount` only;
+        ///     fee is deducted from the taker's BASE receive in TransactionBuilder.
+        func preparePartialFillSwapTransaction(
+            presignedInput: SignedContingentInput,
+            fillBaseAmount: Amount,
+            sciChangeBaseAmount: Amount,
+            payCounterAmount: Amount,
+            fee: Amount,
+            completion: @escaping (Result<PendingTransaction, TransactionPreparationError>)
+            -> Void
+        ) {
+            let counterTokenId = presignedInput.pseudoOutputAmount.tokenId
+
+            guard payCounterAmount.tokenId == counterTokenId else {
+                serialQueue.async {
+                    completion(.failure(.invalidInput(
+                        "payCounterAmount tokenId must match SCI counter tokenId.")))
+                }
+                return
+            }
+            guard fillBaseAmount.tokenId == sciChangeBaseAmount.tokenId,
+                  fillBaseAmount.tokenId != counterTokenId
+            else {
+                serialQueue.async {
+                    completion(.failure(.invalidInput(
+                        "fill/sciChange tokenId must match each other and differ from counter.")))
+                }
+                return
+            }
+            guard payCounterAmount.value > 0, fillBaseAmount.value > 0 else {
+                serialQueue.async {
+                    completion(.failure(.invalidInput(
+                        "payCounterAmount and fillBaseAmount must be > 0.")))
+                }
+                return
+            }
+
+            let (unspentTxOuts, ledgerBlockCount) = account.readSync {
+                ($0.unspentTxOuts(tokenId: counterTokenId), $0.knowableBlockCount)
+            }
+
+            guard ledgerBlockCount <= presignedInput.tombstoneBlockIndex else {
+                serialQueue.async {
+                    completion(.failure(.invalidInput("Presigned Input Expired.")))
+                }
+                return
+            }
+
+            // Fee is always MOB. If counter == MOB, we need to fund the fee from counter
+            // inputs; if counter != MOB, the fee comes out of the BASE receive (handled in
+            // TransactionBuilder.buildPartialFillSwap).
+            let feeFromCounter: UInt64 = (counterTokenId == fee.tokenId) ? fee.value : 0
+
+            logger.info(
+                "Preparing partial-fill swap... counterTokenId: \(counterTokenId), " +
+                    "payCounter: \(redacting: payCounterAmount), " +
+                    "fillBase: \(redacting: fillBaseAmount), " +
+                    "sciChangeBase: \(redacting: sciChangeBaseAmount), " +
+                    "fee: \(redacting: fee), feeFromCounter: \(feeFromCounter), " +
+                    "unspentTxOutValues: \(redacting: unspentTxOuts.map { $0.value })",
+                logFunction: false)
+
+            switch txOutSelector
+                .selectTransactionInputs(
+                    amount: payCounterAmount,
+                    fee: feeFromCounter,
+                    fromTxOuts: unspentTxOuts)
+                .mapError({ error -> TransactionPreparationError in
+                    switch error {
+                    case .insufficientTxOuts:
+                        return .insufficientBalance()
+                    case .defragmentationRequired:
+                        return .defragmentationRequired()
+                    }
+                })
+            {
+            case .success(let inputs):
+                metaFetcher.blockVersion {
+                    switch $0 {
+                    case .success(let blockVersion):
+                        let tombstoneBlockIndex =
+                            min(ledgerBlockCount + 50, presignedInput.tombstoneBlockIndex)
+                        self.transactionPreparer.preparePartialFillSwapTransaction(
+                            presignedInput: presignedInput,
+                            inputs: inputs,
+                            fillBaseAmount: fillBaseAmount,
+                            sciChangeBaseAmount: sciChangeBaseAmount,
+                            fee: fee,
+                            tombstoneBlockIndex: tombstoneBlockIndex,
+                            blockVersion: blockVersion,
+                            completion: completion)
+                    case .failure(let error):
+                        logger.info(
+                            "preparePartialFillSwapTransaction failure: \(error)",
+                            logFunction: false)
+                        serialQueue.async {
+                            completion(.failure(.connectionError(error)))
+                        }
+                    }
+                }
+            case .failure(let error):
+                logger.info(
+                    "preparePartialFillSwapTransaction failure: \(error)",
+                    logFunction: false)
+                serialQueue.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+
         func preparePresignedInputTransaction(
             presignedInput: SignedContingentInput,
             memoType: MemoType,

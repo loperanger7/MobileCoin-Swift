@@ -440,9 +440,154 @@ extension TransactionBuilder {
             signedContingentInput: signedContingentInput)
     }
 
+    private func addSignedContingentInputPartialFill(
+        signedContingentInput: SignedContingentInput,
+        sciChangeAmount: Amount
+    ) -> Result<[Amount], TransactionBuilderError> {
+        TransactionBuilderUtils.addSignedContingentInputPartialFill(
+            ptr: ptr,
+            signedContingentInput: signedContingentInput,
+            sciChangeAmount: sciChangeAmount)
+    }
+
     private func build(
         rng: MobileCoinRng
     ) -> Result<Transaction, TransactionBuilderError> {
         TransactionBuilderUtils.build(ptr: ptr, rng: rng)
+    }
+}
+
+// MARK: - Partial-Fill Swap (MCIP-42)
+
+extension TransactionBuilder {
+    /// Build a partial-fill swap transaction (MCIP-42 taker side).
+    ///
+    /// Composition (the order matters — libmobilecoin's partial-fill C FFI adds the
+    /// proportional COUNTER outputs to the maker and the BASE change to the maker; the
+    /// Swift caller is responsible for the taker's BASE receive and COUNTER change):
+    ///
+    ///   1. taker's COUNTER inputs (`inputs`, all in the SCI's counter token)
+    ///   2. taker's BASE receive output (`fillBaseAmount`, less fee if base==MOB)
+    ///   3. SCI partial-fill input (`sciChangeBaseAmount` = SCI's unfilled remainder in BASE)
+    ///   4. taker's COUNTER change output (= sum(inputs) - counterCost - feeIfCounterIsMOB)
+    ///
+    /// - Parameter inputs: taker's UTXOs in the SCI's counter token. Must all share the SCI's
+    ///   `pseudoOutputAmount.tokenId`.
+    /// - Parameter presignedInput: the partial-fill SCI from DEQS.
+    /// - Parameter fillBaseAmount: base tokens taker wants to receive
+    ///   (= floor(payCounter * partialFillMax / maxCounter)).
+    /// - Parameter sciChangeBaseAmount: base tokens the SCI keeps unfilled
+    ///   (= partialFillMax - fillBaseAmount).
+    static func buildPartialFillSwap(
+        context: TransactionBuilder.Context,
+        inputs: [PreparedTxInput],
+        presignedInput: SignedContingentInput,
+        fillBaseAmount: Amount,
+        sciChangeBaseAmount: Amount
+    ) -> Result<PendingTransaction, TransactionBuilderError> {
+        let counterTokenId = presignedInput.pseudoOutputAmount.tokenId
+        let baseTokenId = fillBaseAmount.tokenId
+        let fee = context.fee
+
+        guard fillBaseAmount.tokenId == sciChangeBaseAmount.tokenId else {
+            return .failure(.invalidInput(
+                "fillBaseAmount and sciChangeBaseAmount must share token id"))
+        }
+        guard fillBaseAmount.tokenId != counterTokenId else {
+            return .failure(.invalidInput("BASE token id must differ from COUNTER token id"))
+        }
+        guard inputs.allSatisfy({ $0.knownTxOut.amount.tokenId == counterTokenId }) else {
+            return .failure(.invalidInput("All inputs must be in SCI's counter token"))
+        }
+
+        let builder: TransactionBuilder
+        do {
+            builder = try TransactionBuilder(
+                context: InnerContext(
+                    blockVersion: context.blockVersion,
+                    fogResolver: context.fogResolver,
+                    memoBuilder: context.memoType.createMemoBuilder(
+                        accountKey: context.accountKey),
+                    tombstoneBlockIndex: context.tombstoneBlockIndex,
+                    fee: fee))
+        } catch {
+            guard let e = error as? TransactionBuilderError else {
+                return .failure(.invalidInput("Unknown Error"))
+            }
+            return .failure(e)
+        }
+
+        for input in inputs {
+            if case .failure(let e) =
+                builder.addInput(preparedTxInput: input, accountKey: context.accountKey) {
+                return .failure(e)
+            }
+        }
+
+        let seededRng = MobileCoinChaCha20Rng(rngSeed: context.rngSeed)
+
+        // Taker's BASE receive. When base == fee token (counter==eUSD direction), the fee
+        // is paid out of the SCI's pseudo input — deduct it from what the taker keeps so
+        // the per-token MOB balance stays consistent.
+        let takerBaseReceive: Amount
+        if baseTokenId == fee.tokenId {
+            guard fillBaseAmount.value > fee.value else {
+                return .failure(.invalidInput(
+                    "fillBaseAmount must exceed fee when base token == fee token"))
+            }
+            takerBaseReceive = Amount(fillBaseAmount.value - fee.value, in: baseTokenId)
+        } else {
+            takerBaseReceive = fillBaseAmount
+        }
+
+        let receiveResult = builder.addOutput(
+            publicAddress: context.accountKey.publicAddress,
+            amount: takerBaseReceive,
+            rng: seededRng)
+
+        // Add the partial-fill SCI. The C FFI internally appends the maker's proportional
+        // counter outputs and the base change output; the returned [Amount] enumerates them
+        // so the caller can compute the taker's counter change precisely.
+        let scResult = builder.addSignedContingentInputPartialFill(
+            signedContingentInput: presignedInput,
+            sciChangeAmount: sciChangeBaseAmount)
+
+        let counterOutlays: [Amount]
+        switch scResult {
+        case .success(let amounts): counterOutlays = amounts
+        case .failure(let e): return .failure(e)
+        }
+
+        let counterCost = counterOutlays
+            .filter { $0.tokenId == counterTokenId }
+            .reduce(UInt64(0)) { $0 &+ $1.value }
+        let inputSum = inputs.reduce(UInt64(0)) { $0 &+ $1.knownTxOut.value }
+        let feeFromCounter: UInt64 = (counterTokenId == fee.tokenId) ? fee.value : 0
+
+        guard inputSum >= counterCost,
+              inputSum - counterCost >= feeFromCounter else {
+            return .failure(.invalidInput(
+                "Counter inputs (\(inputSum)) < counterCost (\(counterCost)) + " +
+                "fee (\(feeFromCounter))"))
+        }
+        let counterChangeAmount = Amount(
+            inputSum - counterCost - feeFromCounter, in: counterTokenId)
+
+        let changeContextResult = builder.addChangeOutput(
+            accountKey: context.accountKey,
+            amount: counterChangeAmount,
+            rng: seededRng)
+
+        return receiveResult.flatMap { receiveContext in
+            changeContextResult.flatMap { changeContext in
+                builder.build(rng: seededRng).map { transaction in
+                    PendingTransaction(
+                        transaction: transaction,
+                        payloadTxOutContexts: [receiveContext],
+                        changeTxOutContext: changeContext,
+                        presignedInputIncomeTxOutContexts: [])
+                }
+            }
+        }
     }
 }

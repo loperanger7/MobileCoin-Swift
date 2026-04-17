@@ -512,6 +512,52 @@ public final class MobileCoinClient {
         }
     }
 
+    /// Prepare a partial-fill swap transaction (MCIP-42 taker side).
+    ///
+    /// The taker pays `payCounterAmount` in the SCI's COUNTER token and receives
+    /// `fillBaseAmount` in the SCI's BASE token. `sciChangeBaseAmount` is the SCI's
+    /// unfilled remainder (i.e. `sci.partialFillMaxBase - fillBaseAmount`); the caller
+    /// computes it from the wire-level metadata DEQS already exposes.
+    ///
+    /// The fee is always in MOB. When BASE == MOB it is deducted from the taker's
+    /// receive output; when COUNTER == MOB it is deducted from the taker's change.
+    public func prepareTransaction(
+        presignedInput: SignedContingentInput,
+        fillBaseAmount: Amount,
+        sciChangeBaseAmount: Amount,
+        payCounterAmount: Amount,
+        fee: Amount,
+        completion: @escaping (Result<PendingTransaction, TransactionPreparationError>)
+        -> Void
+    ) {
+        guard let rngSeed = defaultRng.generateRngSeed() else {
+            completion(.failure(
+                TransactionPreparationError.invalidInput(
+                    "Could not create 32-byte RNG seed")))
+            return
+        }
+
+        Account.TransactionOperations(
+            account: accountLock,
+            fogMerkleProofService: serviceProvider.fogMerkleProofService,
+            fogResolverManager: fogResolverManager,
+            metaFetcher: metaFetcher,
+            txOutSelectionStrategy: txOutSelectionStrategy,
+            mixinSelectionStrategy: mixinSelectionStrategy,
+            rngSeed: rngSeed,
+            targetQueue: serialQueue
+        ).preparePartialFillSwapTransaction(
+            presignedInput: presignedInput,
+            fillBaseAmount: fillBaseAmount,
+            sciChangeBaseAmount: sciChangeBaseAmount,
+            payCounterAmount: payCounterAmount,
+            fee: fee) { result in
+            self.callbackQueue.async {
+                completion(result)
+            }
+        }
+    }
+
     public func submitTransaction(
         transaction: Transaction,
         completion: @escaping (Result<UInt64, SubmitTransactionError>) -> Void
