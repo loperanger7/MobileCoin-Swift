@@ -304,15 +304,15 @@ extension Account {
             completion: @escaping (Result<PendingTransaction, TransactionPreparationError>)
             -> Void
         ) {
-            let counterTokenId = presignedInput.pseudoOutputAmount.tokenId
+            // For an MCIP-42 partial-fill SCI:
+            //   pseudo_output_amount.token_id     = BASE   (maker's input UTXO)
+            //   required_output_amounts[0]        = BASE   (maker's untradeable self-payment)
+            //   input_rules.partial_fill_outputs  = COUNTER (what maker wants from taker)
+            // The Swift `SignedContingentInput` wrapper exposes pseudoOutput / requiredAmount
+            // but not partialFillOutputs, so the COUNTER token is established by the caller
+            // via `payCounterAmount` (which DEQS supplies via the Pair on each Quote).
+            let counterTokenId = payCounterAmount.tokenId
 
-            guard payCounterAmount.tokenId == counterTokenId else {
-                serialQueue.async {
-                    completion(.failure(.invalidInput(
-                        "payCounterAmount tokenId must match SCI counter tokenId.")))
-                }
-                return
-            }
             guard fillBaseAmount.tokenId == sciChangeBaseAmount.tokenId,
                   fillBaseAmount.tokenId != counterTokenId
             else {

@@ -471,8 +471,11 @@ extension TransactionBuilder {
     ///   3. SCI partial-fill input (`sciChangeBaseAmount` = SCI's unfilled remainder in BASE)
     ///   4. taker's COUNTER change output (= sum(inputs) - counterCost - feeIfCounterIsMOB)
     ///
-    /// - Parameter inputs: taker's UTXOs in the SCI's counter token. Must all share the SCI's
-    ///   `pseudoOutputAmount.tokenId`.
+    /// - Parameter inputs: taker's UTXOs in the SCI's COUNTER token. The token id is taken
+    ///   from these inputs, NOT from `presignedInput.pseudoOutputAmount.tokenId` — for an
+    ///   MCIP-42 partial-fill SCI, the pseudoOutput holds the BASE token, while the actual
+    ///   COUNTER lives in `proto.txIn.inputRules.partialFillOutputs[0]` (which the Swift
+    ///   wrapper does not unmask).
     /// - Parameter presignedInput: the partial-fill SCI from DEQS.
     /// - Parameter fillBaseAmount: base tokens taker wants to receive
     ///   (= floor(payCounter * partialFillMax / maxCounter)).
@@ -485,7 +488,16 @@ extension TransactionBuilder {
         fillBaseAmount: Amount,
         sciChangeBaseAmount: Amount
     ) -> Result<PendingTransaction, TransactionBuilderError> {
-        let counterTokenId = presignedInput.pseudoOutputAmount.tokenId
+        // The COUNTER token (what the taker pays) is the token of the taker's inputs.
+        // We do NOT derive COUNTER from `presignedInput.pseudoOutputAmount.tokenId`:
+        // for MCIP-42 partial-fill SCIs that field is the BASE token (maker's input UTXO).
+        // The actual COUNTER lives in `proto.txIn.inputRules.partialFillOutputs[0]`,
+        // which the Swift wrapper does not unmask; the caller supplies it via the
+        // matched-token taker inputs (selected upstream from `payCounterAmount.tokenId`).
+        guard let firstInput = inputs.first else {
+            return .failure(.invalidInput("Partial-fill swap requires at least one taker input"))
+        }
+        let counterTokenId = firstInput.knownTxOut.amount.tokenId
         let baseTokenId = fillBaseAmount.tokenId
         let fee = context.fee
 
