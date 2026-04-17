@@ -96,6 +96,23 @@ final class TxOutSelector {
         ).map { $0.map { txOuts[$0] } }
     }
 
+    /// Variant that caps the number of selected inputs. Used by the partial-fill swap
+    /// path, which must reserve one input slot for the SCI (consensus enforces
+    /// `MaxTxIn = MAX_INPUTS`, and the SCI counts toward that cap).
+    func selectTransactionInputs(
+        amount: Amount,
+        fee: UInt64,
+        fromTxOuts txOuts: [KnownTxOut],
+        maxInputs: Int
+    ) -> Result<[KnownTxOut], TransactionInputSelectionError> {
+        txOutSelectionStrategy.selectTransactionInputs(
+            amount: amount,
+            fee: fee,
+            fromTxOuts: txOuts.map(SelectionTxOut.init),
+            maxInputs: maxInputs
+        ).map { $0.map { txOuts[$0] } }
+    }
+
     func selectTransactionInput(
         amount: Amount,
         feeStrategy: FeeStrategy,

@@ -355,11 +355,16 @@ extension Account {
                     "unspentTxOutValues: \(redacting: unspentTxOuts.map { $0.value })",
                 logFunction: false)
 
+            // Reserve one of the MAX_INPUTS ring-signed input slots for the SCI itself.
+            // Without this cap, the strategy's opportunistic dust-cleanup will fill all
+            // 16 slots with taker UTXOs and the resulting tx (16 user inputs + 1 SCI =
+            // 17 inputs) is rejected by consensus with `tooManyInputs`.
             switch txOutSelector
                 .selectTransactionInputs(
                     amount: payCounterAmount,
                     fee: feeFromCounter,
-                    fromTxOuts: unspentTxOuts)
+                    fromTxOuts: unspentTxOuts,
+                    maxInputs: McConstants.MAX_INPUTS - 1)
                 .mapError({ error -> TransactionPreparationError in
                     switch error {
                     case .insufficientTxOuts:
