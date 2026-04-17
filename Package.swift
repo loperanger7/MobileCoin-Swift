@@ -22,7 +22,7 @@ let package = Package(
         // (LibMobileCoinLibrary.xcframework.zip checksum 1b3c7189...02b88f).
         .package(
             url: "https://github.com/loperanger7/libmobilecoin.git",
-            revision: "4db3be141394379246d76b6f4e8d3c7cb9115442"
+            revision: "36dd9f725ead144b9d18f8de6014a5bc7da0152f"
         ),
         .package(
             url: "https://github.com/apple/swift-protobuf.git",
