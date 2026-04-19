@@ -200,6 +200,50 @@ struct TransactionPreparer {
         })
     }
 
+    /// Multi-SCI array variant. One transaction atomically consumes all `presignedInputs`;
+    /// the SDK builds a single tx with N base receives and one summed counter change. Caller
+    /// supplies aligned per-SCI fill/sciChange arrays.
+    func preparePartialFillSwapTransaction(
+        presignedInputs: [SignedContingentInput],
+        inputs: [KnownTxOut],
+        fillBaseAmounts: [Amount],
+        sciChangeBaseAmounts: [Amount],
+        fee: Amount,
+        tombstoneBlockIndex: UInt64,
+        blockVersion: BlockVersion,
+        completion: @escaping (
+            Result<PendingTransaction, TransactionPreparationError>
+        ) -> Void
+    ) {
+        performAsync(body1: { callback in
+            fogResolverManager.fogResolver(
+                addresses: [selfPaymentAddress],
+                desiredMinPubkeyExpiry: tombstoneBlockIndex,
+                completion: callback)
+        }, body2: { callback in
+            prepareInputs(inputs: inputs, completion: callback)
+        }, completion: {
+            completion($0.mapError { .connectionError($0) }
+                .flatMap { fogResolver, preparedInputs in
+
+                    TransactionBuilder.buildPartialFillSwap(
+                        context: TransactionBuilder.Context(
+                            accountKey: self.accountKey,
+                            blockVersion: blockVersion,
+                            fogResolver: fogResolver,
+                            memoType: .unused,
+                            tombstoneBlockIndex: tombstoneBlockIndex,
+                            fee: fee,
+                            rngSeed: rngSeed),
+                        inputs: preparedInputs,
+                        presignedInputs: presignedInputs,
+                        fillBaseAmounts: fillBaseAmounts,
+                        sciChangeBaseAmounts: sciChangeBaseAmounts
+                    ).mapError { .invalidInput(String(describing: $0)) }
+                })
+        })
+    }
+
     func preparePresignedInputTransaction(
         presignedInput: SignedContingentInput,
         inputs: [KnownTxOut],

@@ -121,6 +121,25 @@ extension MobileCoinClient {
         }
     }
 
+    public func prepareTransaction(
+        presignedInputs: [SignedContingentInput],
+        fillBaseAmounts: [Amount],
+        sciChangeBaseAmounts: [Amount],
+        payCounterAmount: Amount,
+        fee: Amount
+    ) async throws -> PendingTransaction {
+        try await withCheckedThrowingContinuation { continuation in
+            prepareTransaction(
+                presignedInputs: presignedInputs,
+                fillBaseAmounts: fillBaseAmounts,
+                sciChangeBaseAmounts: sciChangeBaseAmounts,
+                payCounterAmount: payCounterAmount,
+                fee: fee) {
+                continuation.resume(with: $0)
+            }
+        }
+    }
+
     @discardableResult
     public func submitTransaction(
         transaction: Transaction

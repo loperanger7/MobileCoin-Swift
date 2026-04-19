@@ -558,6 +558,49 @@ public final class MobileCoinClient {
         }
     }
 
+    /// Multi-SCI partial-fill swap (MCIP-42 taker side).
+    ///
+    /// Aggregates `presignedInputs.count` SCIs into a single atomic transaction. All SCIs
+    /// MUST share `(baseTokenId, counterTokenId)`; the wrapper enforces this defensively.
+    /// `fillBaseAmounts[i]` and `sciChangeBaseAmounts[i]` align 1-to-1 with `presignedInputs[i]`.
+    /// `payCounterAmount` is the SUMMED counter cost across all SCIs (for input selection).
+    public func prepareTransaction(
+        presignedInputs: [SignedContingentInput],
+        fillBaseAmounts: [Amount],
+        sciChangeBaseAmounts: [Amount],
+        payCounterAmount: Amount,
+        fee: Amount,
+        completion: @escaping (Result<PendingTransaction, TransactionPreparationError>)
+        -> Void
+    ) {
+        guard let rngSeed = defaultRng.generateRngSeed() else {
+            completion(.failure(
+                TransactionPreparationError.invalidInput(
+                    "Could not create 32-byte RNG seed")))
+            return
+        }
+
+        Account.TransactionOperations(
+            account: accountLock,
+            fogMerkleProofService: serviceProvider.fogMerkleProofService,
+            fogResolverManager: fogResolverManager,
+            metaFetcher: metaFetcher,
+            txOutSelectionStrategy: txOutSelectionStrategy,
+            mixinSelectionStrategy: mixinSelectionStrategy,
+            rngSeed: rngSeed,
+            targetQueue: serialQueue
+        ).preparePartialFillSwapTransaction(
+            presignedInputs: presignedInputs,
+            fillBaseAmounts: fillBaseAmounts,
+            sciChangeBaseAmounts: sciChangeBaseAmounts,
+            payCounterAmount: payCounterAmount,
+            fee: fee) { result in
+            self.callbackQueue.async {
+                completion(result)
+            }
+        }
+    }
+
     public func submitTransaction(
         transaction: Transaction,
         completion: @escaping (Result<UInt64, SubmitTransactionError>) -> Void

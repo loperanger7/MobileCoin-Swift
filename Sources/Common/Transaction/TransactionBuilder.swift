@@ -602,4 +602,164 @@ extension TransactionBuilder {
             }
         }
     }
+
+    /// Build a partial-fill swap transaction (MCIP-42 taker side) that aggregates N SCIs
+    /// atomically. One transaction consumes all `presignedInputs`; the taker pays a single
+    /// summed counter amount and receives N base outputs.
+    ///
+    /// Composition matches the singular variant, fanned out per SCI:
+    ///   1. taker's COUNTER inputs (all in the shared counter token)
+    ///   2. for each SCI i in [0, N): taker's BASE receive output (`fillBaseAmounts[i]`,
+    ///      less the SINGLE tx-level fee deducted from output 0 only when base == MOB)
+    ///   3. for each SCI i: SCI partial-fill input (`sciChangeBaseAmounts[i]`)
+    ///   4. taker's COUNTER change output
+    ///
+    /// All `presignedInputs` MUST share `(baseTokenId, counterTokenId)` — caller (DEQS query)
+    /// already pre-filters, but a defensive guard is enforced here.
+    static func buildPartialFillSwap(
+        context: TransactionBuilder.Context,
+        inputs: [PreparedTxInput],
+        presignedInputs: [SignedContingentInput],
+        fillBaseAmounts: [Amount],
+        sciChangeBaseAmounts: [Amount]
+    ) -> Result<PendingTransaction, TransactionBuilderError> {
+        guard !presignedInputs.isEmpty else {
+            return .failure(.invalidInput("Multi-SCI swap requires at least one SCI"))
+        }
+        guard presignedInputs.count == fillBaseAmounts.count,
+              presignedInputs.count == sciChangeBaseAmounts.count else {
+            return .failure(.invalidInput(
+                "presignedInputs / fillBaseAmounts / sciChangeBaseAmounts count mismatch"))
+        }
+        guard let firstInput = inputs.first else {
+            return .failure(.invalidInput("Partial-fill swap requires at least one taker input"))
+        }
+        let counterTokenId = firstInput.knownTxOut.amount.tokenId
+        let baseTokenId = fillBaseAmounts[0].tokenId
+        let fee = context.fee
+
+        // Mixed-token guard: every SCI must agree on (base, counter).
+        // Defense-in-depth — the caller's DEQS pre-filter already enforces this, but a
+        // programmer bug bypassing the filter would otherwise corrupt the tx silently.
+        for i in 0..<fillBaseAmounts.count {
+            guard fillBaseAmounts[i].tokenId == baseTokenId,
+                  sciChangeBaseAmounts[i].tokenId == baseTokenId else {
+                return .failure(.invalidInput(
+                    "All fillBaseAmounts and sciChangeBaseAmounts must share the same base token id"))
+            }
+        }
+        guard baseTokenId != counterTokenId else {
+            return .failure(.invalidInput("BASE token id must differ from COUNTER token id"))
+        }
+        guard inputs.allSatisfy({ $0.knownTxOut.amount.tokenId == counterTokenId }) else {
+            return .failure(.invalidInput("All inputs must be in SCI's counter token"))
+        }
+
+        let builder: TransactionBuilder
+        do {
+            builder = try TransactionBuilder(
+                context: InnerContext(
+                    blockVersion: context.blockVersion,
+                    fogResolver: context.fogResolver,
+                    memoBuilder: context.memoType.createMemoBuilder(
+                        accountKey: context.accountKey),
+                    tombstoneBlockIndex: context.tombstoneBlockIndex,
+                    fee: fee))
+        } catch {
+            guard let e = error as? TransactionBuilderError else {
+                return .failure(.invalidInput("Unknown Error"))
+            }
+            return .failure(e)
+        }
+
+        for input in inputs {
+            if case .failure(let e) =
+                builder.addInput(preparedTxInput: input, accountKey: context.accountKey) {
+                return .failure(e)
+            }
+        }
+
+        // CRITICAL: single RNG instance reused across ALL output additions and SCI adds.
+        // Re-seeding per SCI would produce identical commitment masks, and consensus
+        // would reject the tx with duplicate blindings.
+        let seededRng = MobileCoinChaCha20Rng(rngSeed: context.rngSeed)
+
+        // Compute per-SCI taker BASE receive amounts. Single-tx fee deduction: when
+        // base == fee token (counter==eUSD direction, base==MOB), subtract the entire
+        // tx-level fee from the FIRST SCI's receive only — never per-SCI.
+        var takerBaseReceives: [Amount] = []
+        takerBaseReceives.reserveCapacity(fillBaseAmounts.count)
+        if baseTokenId == fee.tokenId {
+            guard fillBaseAmounts[0].value > fee.value else {
+                return .failure(.invalidInput(
+                    "fillBaseAmounts[0] must exceed fee when base token == fee token"))
+            }
+            takerBaseReceives.append(
+                Amount(fillBaseAmounts[0].value - fee.value, in: baseTokenId))
+            for i in 1..<fillBaseAmounts.count {
+                takerBaseReceives.append(fillBaseAmounts[i])
+            }
+        } else {
+            takerBaseReceives = fillBaseAmounts
+        }
+
+        var receiveContexts: [TxOutContext] = []
+        receiveContexts.reserveCapacity(fillBaseAmounts.count)
+        var counterCost: UInt64 = 0
+
+        for i in 0..<presignedInputs.count {
+            let receiveResult = builder.addOutput(
+                publicAddress: context.accountKey.publicAddress,
+                amount: takerBaseReceives[i],
+                rng: seededRng)
+
+            switch receiveResult {
+            case .success(let ctx):
+                receiveContexts.append(ctx)
+            case .failure(let e):
+                return .failure(e)
+            }
+
+            let scResult = builder.addSignedContingentInputPartialFill(
+                signedContingentInput: presignedInputs[i],
+                sciChangeAmount: sciChangeBaseAmounts[i])
+
+            switch scResult {
+            case .success(let amounts):
+                let perSciCounterCost = amounts
+                    .filter { $0.tokenId == counterTokenId }
+                    .reduce(UInt64(0)) { $0 &+ $1.value }
+                counterCost = counterCost &+ perSciCounterCost
+            case .failure(let e):
+                return .failure(e)
+            }
+        }
+
+        let inputSum = inputs.reduce(UInt64(0)) { $0 &+ $1.knownTxOut.value }
+        let feeFromCounter: UInt64 = (counterTokenId == fee.tokenId) ? fee.value : 0
+
+        guard inputSum >= counterCost,
+              inputSum - counterCost >= feeFromCounter else {
+            return .failure(.invalidInput(
+                "Counter inputs (\(inputSum)) < counterCost (\(counterCost)) + " +
+                "fee (\(feeFromCounter))"))
+        }
+        let counterChangeAmount = Amount(
+            inputSum - counterCost - feeFromCounter, in: counterTokenId)
+
+        let changeContextResult = builder.addChangeOutput(
+            accountKey: context.accountKey,
+            amount: counterChangeAmount,
+            rng: seededRng)
+
+        return changeContextResult.flatMap { changeContext in
+            builder.build(rng: seededRng).map { transaction in
+                PendingTransaction(
+                    transaction: transaction,
+                    payloadTxOutContexts: receiveContexts,
+                    changeTxOutContext: changeContext,
+                    presignedInputIncomeTxOutContexts: [])
+            }
+        }
+    }
 }

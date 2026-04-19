@@ -408,6 +408,152 @@ extension Account {
             }
         }
 
+        /// Multi-SCI array variant of `preparePartialFillSwapTransaction`.
+        ///
+        /// All SCIs MUST share `(baseTokenId, counterTokenId)`. The taker's `payCounterAmount`
+        /// is the sum of per-SCI counter payments; aggregating selection here keeps the
+        /// inner builder oblivious to multi-SCI accounting.
+        ///
+        /// Tombstone is `min(ledgerBlockCount + 50, min(SCI tombstones))` — the earliest
+        /// expiry across the bundle bounds tx validity.
+        func preparePartialFillSwapTransaction(
+            presignedInputs: [SignedContingentInput],
+            fillBaseAmounts: [Amount],
+            sciChangeBaseAmounts: [Amount],
+            payCounterAmount: Amount,
+            fee: Amount,
+            completion: @escaping (Result<PendingTransaction, TransactionPreparationError>)
+            -> Void
+        ) {
+            guard !presignedInputs.isEmpty else {
+                serialQueue.async {
+                    completion(.failure(.invalidInput("Multi-SCI swap requires at least one SCI.")))
+                }
+                return
+            }
+            guard presignedInputs.count == fillBaseAmounts.count,
+                  presignedInputs.count == sciChangeBaseAmounts.count else {
+                serialQueue.async {
+                    completion(.failure(.invalidInput(
+                        "presignedInputs / fillBaseAmounts / sciChangeBaseAmounts count mismatch.")))
+                }
+                return
+            }
+            let counterTokenId = payCounterAmount.tokenId
+            let baseTokenId = fillBaseAmounts[0].tokenId
+
+            for i in 0..<fillBaseAmounts.count {
+                guard fillBaseAmounts[i].tokenId == baseTokenId,
+                      sciChangeBaseAmounts[i].tokenId == baseTokenId else {
+                    serialQueue.async {
+                        completion(.failure(.invalidInput(
+                            "All fillBaseAmounts/sciChangeBaseAmounts must share base token id.")))
+                    }
+                    return
+                }
+            }
+            guard baseTokenId != counterTokenId else {
+                serialQueue.async {
+                    completion(.failure(.invalidInput(
+                        "BASE token id must differ from COUNTER token id.")))
+                }
+                return
+            }
+            guard payCounterAmount.value > 0,
+                  fillBaseAmounts.allSatisfy({ $0.value > 0 }) else {
+                serialQueue.async {
+                    completion(.failure(.invalidInput(
+                        "payCounterAmount and all fillBaseAmounts must be > 0.")))
+                }
+                return
+            }
+
+            let (unspentTxOuts, ledgerBlockCount) = account.readSync {
+                ($0.unspentTxOuts(tokenId: counterTokenId), $0.knowableBlockCount)
+            }
+
+            let minSciTombstone = presignedInputs
+                .map { $0.tombstoneBlockIndex }
+                .min() ?? 0
+            guard ledgerBlockCount <= minSciTombstone else {
+                serialQueue.async {
+                    completion(.failure(.invalidInput("Presigned Input Expired.")))
+                }
+                return
+            }
+
+            let feeFromCounter: UInt64 = (counterTokenId == fee.tokenId) ? fee.value : 0
+
+            logger.info(
+                "Preparing multi-SCI partial-fill swap... " +
+                    "sciCount: \(presignedInputs.count), counterTokenId: \(counterTokenId), " +
+                    "payCounter: \(redacting: payCounterAmount), " +
+                    "fillBaseSum: \(redacting: fillBaseAmounts.map { $0.value }), " +
+                    "sciChangeBaseSum: \(redacting: sciChangeBaseAmounts.map { $0.value }), " +
+                    "fee: \(redacting: fee), feeFromCounter: \(feeFromCounter), " +
+                    "unspentTxOutValues: \(redacting: unspentTxOuts.map { $0.value })",
+                logFunction: false)
+
+            // Reserve a slot for each SCI input (MAX_INPUTS - N), so consensus
+            // doesn't reject for tooManyInputs after we add the N partial-fill SCIs.
+            let maxTakerInputs = McConstants.MAX_INPUTS - presignedInputs.count
+            guard maxTakerInputs > 0 else {
+                serialQueue.async {
+                    completion(.failure(.invalidInput(
+                        "Too many SCIs for MAX_INPUTS budget.")))
+                }
+                return
+            }
+
+            switch txOutSelector
+                .selectTransactionInputs(
+                    amount: payCounterAmount,
+                    fee: feeFromCounter,
+                    fromTxOuts: unspentTxOuts,
+                    maxInputs: maxTakerInputs)
+                .mapError({ error -> TransactionPreparationError in
+                    switch error {
+                    case .insufficientTxOuts:
+                        return .insufficientBalance()
+                    case .defragmentationRequired:
+                        return .defragmentationRequired()
+                    }
+                })
+            {
+            case .success(let inputs):
+                metaFetcher.blockVersion {
+                    switch $0 {
+                    case .success(let blockVersion):
+                        let tombstoneBlockIndex =
+                            min(ledgerBlockCount + 50, minSciTombstone)
+                        self.transactionPreparer.preparePartialFillSwapTransaction(
+                            presignedInputs: presignedInputs,
+                            inputs: inputs,
+                            fillBaseAmounts: fillBaseAmounts,
+                            sciChangeBaseAmounts: sciChangeBaseAmounts,
+                            fee: fee,
+                            tombstoneBlockIndex: tombstoneBlockIndex,
+                            blockVersion: blockVersion,
+                            completion: completion)
+                    case .failure(let error):
+                        logger.info(
+                            "preparePartialFillSwapTransaction (multi) failure: \(error)",
+                            logFunction: false)
+                        serialQueue.async {
+                            completion(.failure(.connectionError(error)))
+                        }
+                    }
+                }
+            case .failure(let error):
+                logger.info(
+                    "preparePartialFillSwapTransaction (multi) failure: \(error)",
+                    logFunction: false)
+                serialQueue.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+
         func preparePresignedInputTransaction(
             presignedInput: SignedContingentInput,
             memoType: MemoType,
